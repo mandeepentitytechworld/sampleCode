@@ -1,0 +1,273 @@
+using Accounts.Data;
+using Accounts.Data.Entities;
+using Aurora.Module.Sync;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using RestSharp;
+using RestSharp.Authenticators;
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+using System.Linq;
+using WooCommerce.Products.Sync.Module.Data;
+using WooCommerce.Products.Sync.Module.Data.Entities;
+
+namespace WooCommerce.Products.Sync.Module
+{
+    public class Client : DestinationSyncModule<Stockitem, Data.Entities.WooCommerceProduct>, IClient
+    {
+        public ModuleConfig Configuration { get; }
+        private readonly RestClient client;
+        /// <summary>  The destination data context where created items are stored.</summary>
+        /// <value>The destination data context.</value>
+        public Data.ModuleDataContext DestinationDataContext { get; set; }
+
+        /// <summary>The source data context where a list of new or updated items are retrieved from.</summary>
+        /// <value>The source data context.</value>
+        public Accounts.Data.AccountDataContext SourceDataContext { get; set; }
+
+        //Initialize RestSharp Client
+        public Client(ModuleConfig configuration)
+        {
+            Configuration = configuration;
+            SourceDataContext = new AccountDataContext();
+            DestinationDataContext = new ModuleDataContext();
+
+            //add headers or authentication for the REST Api Endpoint
+            client = new RestClient(ConfigurationManager.AppSettings["baseURL"]);
+            client.Authenticator = new HttpBasicAuthenticator(ConfigurationManager.AppSettings["consumerKey"], ConfigurationManager.AppSettings["consumerSecret"]);
+        }
+
+        /// <summary>
+        /// Push new products into woo commerce of having SyncStatus = "New"
+        /// Then update source database record with SyncStatus = "Success" and WooCommerceProductId
+        /// Then update same product into destination database
+        /// </summary>
+        public void Create()
+        {
+            try
+            {
+                //fetch products from source database
+                string _status = SyncStatus.New.ToString();
+                var sourceProducts = SourceDataContext.SourceProducts.Where(c => c.SyncStatus == _status).Select(c => c).ToList();
+                if (sourceProducts.Count() > 0)
+                {
+                    foreach (var sourceProduct in sourceProducts)
+                    {
+                        //convert model to view model
+                        ViewModel.Products product = GetProductFromSourceProduct(sourceProduct);
+
+                        //convert data into json & push data into wooCommerce
+                        IRestResponse response = PushDataIntoWooCommerce(product);
+
+                        if (!response.IsSuccessful)
+                        {
+                            Console.WriteLine(response.Content);
+                            Console.ReadLine();
+                        }
+                        else
+                        {
+                            var _wooProductId = JsonConvert.DeserializeObject<ViewModel.Products>(response.Content).Id;
+
+                            //update Synced data status at source database
+                            _status = SyncStatus.Success.ToString();
+                            sourceProduct.SyncStatus = "Success";
+                            sourceProduct.WooCommerceProductId = _wooProductId;
+                            SourceDataContext.SaveChanges();
+
+                            //update Synced data at destination database
+                            UpdateDestinationDatabase(product);
+
+                            Console.WriteLine("Data saved successfully.");
+                            Console.ReadLine();
+                        }
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("No new record found at source database.");
+                    Console.ReadLine();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex.Message);
+                Console.ReadLine();
+            }
+        }
+
+        /// <summary>
+        /// Update products into woo commerce of having SyncStatus = "Updated"
+        /// Then update source database record with SyncStatus = "Success"
+        /// Then update same product into destination database
+        /// </summary>
+        public void Update()
+        {
+            string _status = SyncStatus.Updated.ToString();
+            var sourceProducts = SourceDataContext.SourceProducts.Where(c => c.SyncStatus == _status).Select(c => c).ToList();
+
+            if (sourceProducts.Count() > 0)
+            {
+                foreach (var product in sourceProducts)
+                {
+                    //get product from wooCommerce by id
+                    var request = CreateRequest("wp-json/wc/v3/products/" + product.WooCommerceProductId, Method.GET);
+                    request.AddParameter("application/json", "", ParameterType.RequestBody);
+
+                    //fetch data into wooCommerce
+                    IRestResponse response = client.Execute(request);
+
+                    //convert woo product json to model
+                    var _wooProduct = JsonConvert.DeserializeObject<ViewModel.Products>(response.Content);
+
+                    _wooProduct.date_on_sale_from = product.date_on_sale_from;
+                    _wooProduct.date_on_sale_to = product.date_on_sale_to;
+                    _wooProduct.featured = product.featured;
+                    _wooProduct.name = product.name;
+                    _wooProduct.on_sale = product.on_sale;
+                    _wooProduct.price = product.price;
+                    _wooProduct.regular_price = product.regular_price;
+                    _wooProduct.sale_price = product.sale_price;
+                    _wooProduct.short_description = product.short_description;
+                    _wooProduct.stock_quantity = product.stock_quantity;
+                    _wooProduct.type = product.type;
+
+                    _wooProduct.images = new List<ViewModel.ProductImage>();
+
+                    var pImages = SourceDataContext.SourceProductImages.Where(c => c.SourceProduct.Id == product.Id).ToList();
+                    foreach (var imageItm in pImages)
+                    {
+                        var _image = new ViewModel.ProductImage();
+                        _image.src = imageItm.src;
+
+                        _wooProduct.images.Add(_image);
+                    }
+
+                    //convert data into json & push data into wooCommerce
+                    response = PushDataIntoWooCommerce(_wooProduct);
+
+                    if (!response.IsSuccessful)
+                    {
+                        Console.WriteLine(response.Content);
+                        Console.ReadLine();
+                    }
+                    else
+                    {
+                        //update Synced data status at source database
+                        _status = SyncStatus.Success.ToString();
+                        product.SyncStatus = "Success";
+                        SourceDataContext.SaveChanges();
+
+                        //update Synced data at destination database
+                        //convert model to view model
+                        ViewModel.Products _product = GetProductFromSourceProduct(product);
+                        UpdateDestinationDatabase(_product);
+
+                        Console.WriteLine("Data updated successfully.");
+                        Console.ReadLine();
+                    }
+                }
+            }
+            else
+            {
+                Console.WriteLine("No updated record found at source database.");
+                Console.ReadLine();
+            }
+        }
+
+        private RestRequest CreateRequest(string path, Method method)
+        {
+            var request = new RestRequest(path, method);
+            request.AddHeader("Content-Type", "application/json");
+            return request;
+        }
+
+        /// <summary>
+        /// Push ViewModel.Products into Woo Commerce
+        /// </summary>
+        /// <param name="product"></param>
+        /// <returns></returns>
+        private IRestResponse PushDataIntoWooCommerce(ViewModel.Products product)
+        {
+            //convert data into json
+            string requestParameter = JsonConvert.SerializeObject(product);
+            string _firstTwo = requestParameter.Substring(0, 2);
+            if (_firstTwo == "[{")
+                requestParameter = "{" + requestParameter.Substring(2, requestParameter.Length - 4) + "}";
+            var request = CreateRequest("wp-json/wc/v3/products", Method.POST);
+            request.AddParameter("application/json", requestParameter, ParameterType.RequestBody);
+
+            //push data into wooCommerce
+            IRestResponse response = client.Execute(request);
+
+            return response;
+        }
+
+        /// <summary>
+        /// update destination database from ViewModel.Products
+        /// </summary>
+        /// <param name="product"></param>
+        private void UpdateDestinationDatabase(ViewModel.Products product)
+        {
+            DestinationProducts _product = new DestinationProducts();
+            _product.date_on_sale_from = product.date_on_sale_from;
+            _product.date_on_sale_to = product.date_on_sale_to;
+            _product.featured = product.featured;
+            _product.name = product.name;
+            _product.on_sale = product.on_sale;
+            _product.price = product.price;
+            _product.regular_price = product.regular_price;
+            _product.sale_price = product.sale_price;
+            _product.short_description = product.short_description;
+            _product.stock_quantity = product.stock_quantity;
+            _product.type = product.type;
+
+            DestinationDataContext.DestinationProducts.Add(_product);
+            DestinationDataContext.SaveChanges();
+
+            foreach (var img in product.images)
+            {
+                DestinationProductImages destinationProductImage = new DestinationProductImages();
+                destinationProductImage.SourceProduct = _product;
+                destinationProductImage.src = img.src;
+
+                DestinationDataContext.DestinationProductImages.Add(destinationProductImage);
+                DestinationDataContext.SaveChanges();
+            }
+        }
+
+        /// <summary>
+        /// Convert Entities.SourceProducts to ViewModel.Products
+        /// </summary>
+        /// <param name="sourceProduct"></param>
+        /// <returns></returns>
+        private ViewModel.Products GetProductFromSourceProduct(SourceProducts sourceProduct)
+        {
+            ViewModel.Products product = new ViewModel.Products();
+            product.date_on_sale_from = sourceProduct.date_on_sale_from;
+            product.date_on_sale_to = sourceProduct.date_on_sale_to;
+            product.featured = sourceProduct.featured;
+            product.name = sourceProduct.name;
+            product.on_sale = sourceProduct.on_sale;
+            product.price = sourceProduct.price;
+            product.regular_price = sourceProduct.regular_price;
+            product.sale_price = sourceProduct.sale_price;
+            product.short_description = sourceProduct.short_description;
+            product.stock_quantity = sourceProduct.stock_quantity;
+            product.type = sourceProduct.type;
+
+            product.images = new List<ViewModel.ProductImage>();
+
+            var pImages = SourceDataContext.SourceProductImages.Where(c => c.SourceProduct.Id == sourceProduct.Id).ToList();
+            foreach (var imageItm in pImages)
+            {
+                var _image = new ViewModel.ProductImage();
+                _image.src = imageItm.src;
+
+                product.images.Add(_image);
+            }
+
+            return product;
+        }
+    }
+}
